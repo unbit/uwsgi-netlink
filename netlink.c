@@ -101,7 +101,6 @@ static void netlink_socket_queue_unix_diag_first_run() {
 
 	// now wait for the response
 	uint8_t buf[8192];
-	for(;;) {
 		int ret = uwsgi_waitfd_event(fd, 1, POLLIN);
 		if (ret <= 0) goto end;
 		ssize_t rlen = recv(fd, buf, 8192, 0);
@@ -135,7 +134,7 @@ static void netlink_socket_queue_unix_diag_first_run() {
 			
 			nlh = NLMSG_NEXT(nlh, rlen);
 		}
-	}
+
 end:
 	close(fd);
 }
@@ -159,7 +158,6 @@ static void netlink_socket_queue_unix_diag(struct netlink_uwsgi_socket_map *nusm
 
         // now wait for the response
         uint8_t buf[8192];
-        for(;;) {
                 int ret = uwsgi_waitfd_event(fd, 1, POLLIN);
                 if (ret <= 0) goto end;
                 ssize_t rlen = recv(fd, buf, 8192, 0);
@@ -186,7 +184,6 @@ static void netlink_socket_queue_unix_diag(struct netlink_uwsgi_socket_map *nusm
 
                         nlh = NLMSG_NEXT(nlh, rlen);
                 }
-        }
 end:
         close(fd);
 
