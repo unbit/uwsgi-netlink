@@ -4,6 +4,10 @@ extern struct uwsgi_server uwsgi;
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
+#ifndef NETLINK_SOCK_DIAG
+#define NETLINK_SOCK_DIAG       4
+#endif
+
 #include <linux/sock_diag.h>
 #include <linux/unix_diag.h>
 
