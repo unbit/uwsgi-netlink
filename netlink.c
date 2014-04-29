@@ -59,36 +59,7 @@ int uwsgi_netlink_sendmsg(int fd, uint16_t type, uint16_t flags, void *buf, size
 	return ret;
 }
 
-struct netlink_uwsgi_socket_map {
-	struct uwsgi_socket *uwsgi_sock;
-	ino_t inode;
-	uint32_t cookie[2];
-	struct netlink_uwsgi_socket_map *next;
-};
-
-static struct netlink_uwsgi_socket_map *netlink_unix_sockets_map;
-
-static void netlink_add_uwsgi_socket_map(struct uwsgi_socket *uwsgi_sock, ino_t inode, uint32_t cookie0, uint32_t cookie1) {
-	struct netlink_uwsgi_socket_map *nusm = netlink_unix_sockets_map, *old_nusm = NULL;
-	while(nusm) {
-		old_nusm = nusm;
-		nusm = nusm->next;
-	}
-
-	nusm = uwsgi_calloc(sizeof(struct netlink_uwsgi_socket_map));
-	nusm->uwsgi_sock = uwsgi_sock;
-	nusm->inode = inode;
-	nusm->cookie[0] = cookie0;
-	nusm->cookie[1] = cookie1;
-	if (old_nusm) {
-		old_nusm->next = nusm;
-	}
-	else {
-		netlink_unix_sockets_map = nusm;
-	}
-}
-
-static void netlink_socket_queue_unix_diag_first_run() {
+static void netlink_socket_queue_unix_diag_run() {
 
 	int fd = uwsgi_netlink_new(NETLINK_SOCK_DIAG);
 	if (fd < 0) return;
@@ -99,7 +70,7 @@ static void netlink_socket_queue_unix_diag_first_run() {
 	udr.sdiag_family = AF_UNIX;
 	udr.sdiag_protocol = SOCK_STREAM;
 	udr.udiag_states = 1<<TCP_LISTEN;
-	udr.udiag_show = UDIAG_SHOW_NAME;
+	udr.udiag_show = UDIAG_SHOW_NAME|UDIAG_SHOW_RQLEN;
 
 	if (uwsgi_netlink_sendmsg(fd, SOCK_DIAG_BY_FAMILY, NLM_F_DUMP|NLM_F_REQUEST, &udr, sizeof(struct unix_diag_req)) < 0) goto end;
 
@@ -120,6 +91,7 @@ static void netlink_socket_queue_unix_diag_first_run() {
 			struct unix_diag_msg *udm = (struct unix_diag_msg *) NLMSG_DATA(nlh);
 			size_t diag_len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct unix_diag_msg));
 			struct rtattr *attr = (struct rtattr *) (udm+1);
+			struct uwsgi_socket *found_sock = NULL;
 			while (RTA_OK(attr, diag_len)) {
 				if (attr->rta_type == UNIX_DIAG_NAME) {
 					struct uwsgi_socket *uwsgi_sock = uwsgi.sockets;
@@ -127,10 +99,19 @@ static void netlink_socket_queue_unix_diag_first_run() {
 						if (uwsgi_sock->family == AF_UNIX) {
 							// the payload size includes the final 0
 							if (!uwsgi_strncmp(RTA_DATA(attr), RTA_PAYLOAD(attr)-1, uwsgi_sock->name, uwsgi_sock->name_len)) {
-								netlink_add_uwsgi_socket_map(uwsgi_sock, udm->udiag_ino, udm->udiag_cookie[0], udm->udiag_cookie[1]);
+								found_sock = uwsgi_sock;
 							}
 						}
 						uwsgi_sock = uwsgi_sock->next;
+					}
+				}
+				else if (attr->rta_type == UNIX_DIAG_RQLEN) {
+					struct unix_diag_rqlen *rql = (struct unix_diag_rqlen *) RTA_DATA(attr);
+					if (found_sock) {
+						found_sock->queue = rql->udiag_rqueue;
+						found_sock->max_queue = rql->udiag_wqueue;
+						// overengineering
+						found_sock = NULL;
 					}
 				}
 				attr = RTA_NEXT(attr, diag_len);
@@ -143,73 +124,7 @@ end:
 	close(fd);
 }
 
-static void netlink_socket_queue_unix_diag(struct netlink_uwsgi_socket_map *nusm) {
-	int fd = uwsgi_netlink_new(NETLINK_SOCK_DIAG);
-        if (fd < 0) return;
-
-        struct unix_diag_req udr;
-        memset(&udr, 0, sizeof(struct unix_diag_req));
-
-        udr.sdiag_family = AF_UNIX;
-        udr.sdiag_protocol = SOCK_STREAM;
-        udr.udiag_states = 1<<TCP_LISTEN;
-        udr.udiag_ino = nusm->inode;
-        udr.udiag_cookie[0] = nusm->cookie[0];
-        udr.udiag_cookie[1] = nusm->cookie[1];
-        udr.udiag_show = UDIAG_SHOW_RQLEN;
-
-        if (uwsgi_netlink_sendmsg(fd, SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST, &udr, sizeof(struct unix_diag_req)) < 0) goto end;
-
-        // now wait for the response
-        uint8_t buf[8192];
-                int ret = uwsgi_waitfd_event(fd, 1, POLLIN);
-                if (ret <= 0) goto end;
-                ssize_t rlen = recv(fd, buf, 8192, 0);
-                if (rlen <= 0) goto end;
-                struct nlmsghdr *nlh = (struct nlmsghdr *) buf;
-                while(NLMSG_OK(nlh, rlen)) {
-                        if (nlh->nlmsg_type == NLMSG_DONE) goto end;
-                        if (nlh->nlmsg_type == NLMSG_ERROR) {
-                                struct nlmsgerr *nle = (struct nlmsgerr *) NLMSG_DATA(nlh);
-                                uwsgi_log("[uwsgi-netlink] error: %d %s\n", nle->error, strerror(-nle->error));
-                                goto end;
-                        }
-                        struct unix_diag_msg *udm = (struct unix_diag_msg *) NLMSG_DATA(nlh);
-                        size_t diag_len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct unix_diag_msg));
-                        struct rtattr *attr = (struct rtattr *) (udm+1);
-                        while (RTA_OK(attr, diag_len)) {
-                                if (attr->rta_type == UNIX_DIAG_RQLEN) {
-					struct unix_diag_rqlen *udrq = (struct unix_diag_rqlen *) RTA_DATA(attr);
-					nusm->uwsgi_sock->queue = udrq->udiag_rqueue;
-					nusm->uwsgi_sock->max_queue = udrq->udiag_wqueue;
-                                }
-                                attr = RTA_NEXT(attr, diag_len);
-                        }
-
-                        nlh = NLMSG_NEXT(nlh, rlen);
-                }
-end:
-        close(fd);
-
-}
-
-static void netlink_master_cycle() {
-	static int sockets_gathered = 0;
-	if (!sockets_gathered) {
-		// run only the first time
-		netlink_socket_queue_unix_diag_first_run();
-		sockets_gathered = 1;
-	}
-
-	// run constantly
-	struct netlink_uwsgi_socket_map *nusm = netlink_unix_sockets_map;	
-	while(nusm) {
-		netlink_socket_queue_unix_diag(nusm);
-		nusm = nusm->next;
-	}
-}
-
 struct uwsgi_plugin netlink_plugin = {
 	.name = "netlink",
-	.master_cycle = netlink_master_cycle,
+	.master_cycle = netlink_socket_queue_unix_diag_run,
 };
