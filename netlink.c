@@ -61,6 +61,12 @@ int uwsgi_netlink_sendmsg(int fd, uint16_t type, uint16_t flags, void *buf, size
 
 static void netlink_socket_queue_unix_diag_run() {
 
+	static time_t last_run = 0;
+
+	// avoid netlink storming
+	if (last_run > 0 && last_run == uwsgi.current_time) return;
+	last_run = uwsgi.current_time;
+
 	int fd = uwsgi_netlink_new(NETLINK_SOCK_DIAG);
 	if (fd < 0) return;
 
